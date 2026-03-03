@@ -1,6 +1,6 @@
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
-LABEL authors="jaret"
+LABEL authors="frostbyt3"
 
 # Set noninteractive to avoid timezone prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -55,21 +55,21 @@ RUN pip install --no-cache-dir torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.
 ARG CACHEBUST=1234
 ARG GIT_COMMIT=main
 RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git && \
-    cd ai-toolkit && \
+    git clone https://github.com/frost-byte/ai_toolkit_bdv.git ai-toolkit-bdv && \
+    cd ai-toolkit-bdv && \
     git checkout ${GIT_COMMIT}
 
-WORKDIR /app/ai-toolkit
+WORKDIR /app/ai-toolkit-bdv
 
 # copy requirements.txt to leverage docker cache
-COPY requirements.txt /app/ai-toolkit/requirements.txt
+COPY requirements.txt /app/ai-toolkit-bdv/requirements.txt
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt && \
     pip install setuptools==69.5.1 --no-cache-dir --break-system-packages
 
 # Build UI
-WORKDIR /app/ai-toolkit/ui
+WORKDIR /app/ai-toolkit-bdv/ui
 RUN npm install && \
     npm run build && \
     npm run update_db
