@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import torch
 import torchaudio
+import types
 from transformers import Gemma3Config
 import yaml
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
@@ -213,6 +214,7 @@ class LTX2Model(BaseModel):
         # use the new format on this new model by default
         self.use_old_lokr_format = False
         self.audio_processor = None
+        self._warned_missing_audio = False
         
         # gemma needs left side padding
         self.te_padding_side = "left"
@@ -466,6 +468,47 @@ class LTX2Model(BaseModel):
         pipe.text_encoder = text_encoder
         pipe.transformer = transformer
 
+        # Diffusers SDPA can raise dtype errors if connector masks come back as bf16
+        # while queries are float32 (common with mixed quantized/offloaded execution).
+        # Force connector attention masks to float32 centrally for both training/inference.
+        _orig_connectors_forward = pipe.connectors.forward
+        def _connectors_forward_cast_mask(this, *args, **kwargs):
+            out = _orig_connectors_forward(*args, **kwargs)
+            if isinstance(out, tuple) and len(out) == 3:
+                p, ap, m = out
+                if torch.is_tensor(m) and m.dtype != torch.float32:
+                    m = m.to(dtype=torch.float32)
+                return p, ap, m
+            return out
+        pipe.connectors.forward = types.MethodType(_connectors_forward_cast_mask, pipe.connectors)
+
+        # Final safety net: normalize attention-mask dtypes at transformer entry.
+        # This covers both direct training calls and diffusers pipeline sampling calls.
+        _orig_transformer_forward = pipe.transformer.forward
+        def _transformer_forward_cast_masks(this, *args, **kwargs):
+            for mask_key in ("encoder_attention_mask", "audio_encoder_attention_mask"):
+                mask = kwargs.get(mask_key, None)
+                if torch.is_tensor(mask) and mask.dtype != torch.bool and mask.dtype != torch.float32:
+                    kwargs[mask_key] = mask.to(dtype=torch.float32)
+            return _orig_transformer_forward(*args, **kwargs)
+        pipe.transformer.forward = types.MethodType(_transformer_forward_cast_masks, pipe.transformer)
+
+        # Absolute fallback: patch torch SDPA so attn_mask always matches query dtype.
+        # Diffusers resolves attention backends from an internal registry, so patching
+        # module-level function names is ineffective. All backends ultimately call
+        # torch.nn.functional.scaled_dot_product_attention, so patching that is the
+        # only reliable interception point.
+        import torch.nn.functional as _F
+        if not getattr(_F, '_aitk_sdpa_guarded', False):
+            _orig_sdpa = _F.scaled_dot_product_attention
+            def _sdpa_mask_dtype_safe(query, key, value, attn_mask=None, **kwargs):
+                if attn_mask is not None and attn_mask.dtype != torch.bool:
+                    if attn_mask.dtype != query.dtype:
+                        attn_mask = attn_mask.to(dtype=query.dtype)
+                return _orig_sdpa(query, key, value, attn_mask=attn_mask, **kwargs)
+            _F.scaled_dot_product_attention = _sdpa_mask_dtype_safe
+            _F._aitk_sdpa_guarded = True
+
         self.print_and_status_update("Preparing Model")
 
         text_encoder = [pipe.text_encoder]
@@ -480,6 +523,39 @@ class LTX2Model(BaseModel):
         text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
+        # These modules are inference-only for training and should stay frozen by default.
+        pipe.audio_vae.requires_grad_(False)
+        pipe.audio_vae.eval()
+        
+        _tc = getattr(self, 'train_config', None)
+
+        if _tc is not None and getattr(_tc, "train_text_encoder", False):
+            pipe.connectors.requires_grad_(True)
+            pipe.connectors.train()
+            if "LTX2TextConnectors" not in self.target_lora_modules:
+                self.target_lora_modules.append("LTX2TextConnectors")
+        else:
+            pipe.connectors.requires_grad_(False)
+            pipe.connectors.eval()
+            
+        pipe.vocoder.requires_grad_(False)
+        pipe.vocoder.eval()
+
+        if _tc is None or getattr(_tc, "gradient_checkpointing", True):
+            if hasattr(pipe.transformer, 'enable_gradient_checkpointing'):
+                pipe.transformer.enable_gradient_checkpointing()
+            elif hasattr(pipe.transformer, 'set_gradient_checkpointing'):
+                pipe.transformer.set_gradient_checkpointing(True)
+            elif hasattr(pipe.transformer, '_enable_gradient_checkpointing'):
+                pipe.transformer._enable_gradient_checkpointing = True
+
+        # Enforce optimal attention backend on supported hardware
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+        except Exception:
+            pass
+
         flush()
 
         # save it to the model class
@@ -635,118 +711,30 @@ class LTX2Model(BaseModel):
         conditional_embeds = self.pad_embeds(conditional_embeds)
         unconditional_embeds = self.pad_embeds(unconditional_embeds)
 
-        # --- FREEFUSE LOGIC ---
-        if getattr(gen_config, 'use_freefuse', False) and len(getattr(gen_config, 'freefuse_concepts', [])) > 0:
-            import toolkit.models.freefuse as freefuse
-            
-            # 1. Initialize State & Find Tokens
-            ff_state = freefuse.FreeFuseState(concepts=gen_config.freefuse_concepts, extract_step=gen_config.freefuse_extract_step)
-            ff_state.find_token_indices(self.tokenizer[0], gen_config.prompt, padding_side=self.te_padding_side)
-            freefuse.FreeFuseState.set_instance(ff_state)
-            
-            # 2. Inject Processor
-            freefuse.inject_freefuse_processor(pipeline.transformer, ff_state)
-            
-            # 3. Phase 1: Extract (Run for N steps and halt)
-            ff_state.phase = 1
-            latents_clone = gen_config.latents.clone() if gen_config.latents is not None else None
-            if latents_clone is None:
-                # generate latents manually to ensure phase 1 and phase 2 match perfectly
-                num_channels_latents = pipeline.transformer.config.in_channels
-                latents_clone = pipeline.prepare_latents(
-                    1,
-                    num_channels_latents,
-                    gen_config.num_frames,
-                    gen_config.height,
-                    gen_config.width,
-                    self.torch_dtype,
-                    self.device_torch,
-                    generator,
-                    None
-                )
-                gen_config.latents = latents_clone
-            
-            def stop_callback(pipe, step_index, timestep, callback_kwargs):
-                if step_index >= ff_state.extract_step:
-                    pipe._interrupt = True
-                return callback_kwargs
-            
-            print(f"Running FreeFuse Phase 1 (Extraction) for {ff_state.extract_step} steps...")
-            
-            try:
-                _ = pipeline(
-                    prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
-                    prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch),
-                    negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
-                    negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch),
-                    height=gen_config.height,
-                    width=gen_config.width,
-                    num_inference_steps=gen_config.num_inference_steps,
-                    guidance_scale=gen_config.guidance_scale,
-                    latents=latents_clone.clone(),
-                    num_frames=gen_config.num_frames,
-                    generator=generator,
-                    return_dict=False,
-                    output_type="latent",
-                    callback_on_step_end=stop_callback,
-                    **extra,
-                )
-            except Exception as e:
-                pass
-            
-            # 4. Process Maps
-            ff_state.calculate_routing_masks()
-            print("FreeFuse Phase 1 Complete. Masks calculated.")
-            
-            # 5. Phase 2: Generate
-            ff_state.phase = 2
-            
-            video, audio = pipeline(
-                prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
-                prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch),
-                negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch, dtype=self.torch_dtype),
-                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch),
-                height=gen_config.height,
-                width=gen_config.width,
-                num_inference_steps=gen_config.num_inference_steps,
-                guidance_scale=gen_config.guidance_scale,
-                latents=latents_clone.clone(),
-                num_frames=gen_config.num_frames,
-                generator=generator,
-                return_dict=False,
-                output_type="np" if is_video else "pil",
-                **extra,
-            )
-            
-            # 6. Cleanup
-            freefuse.remove_freefuse_processor(pipeline.transformer)
-            freefuse.FreeFuseState.set_instance(None)
-            
-        else:
-            video, audio = pipeline(
-                prompt_embeds=conditional_embeds.text_embeds.to(
-                    self.device_torch, dtype=self.torch_dtype
-                ),
-                prompt_attention_mask=conditional_embeds.attention_mask.to(
-                    self.device_torch
-                ),
-                negative_prompt_embeds=unconditional_embeds.text_embeds.to(
-                    self.device_torch, dtype=self.torch_dtype
-                ),
-                negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
-                    self.device_torch
-                ),
-                height=gen_config.height,
-                width=gen_config.width,
-                num_inference_steps=gen_config.num_inference_steps,
-                guidance_scale=gen_config.guidance_scale,
-                latents=gen_config.latents,
-                num_frames=gen_config.num_frames,
-                generator=generator,
-                return_dict=False,
-                output_type="np" if is_video else "pil",
-                **extra,
-            )
+        video, audio = pipeline(
+            prompt_embeds=conditional_embeds.text_embeds.to(
+                self.device_torch, dtype=self.torch_dtype
+            ),
+            prompt_attention_mask=conditional_embeds.attention_mask.to(
+                self.device_torch, dtype=torch.bool
+            ),
+            negative_prompt_embeds=unconditional_embeds.text_embeds.to(
+                self.device_torch, dtype=self.torch_dtype
+            ),
+            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(
+                self.device_torch, dtype=torch.bool
+            ),
+            height=gen_config.height,
+            width=gen_config.width,
+            num_inference_steps=gen_config.num_inference_steps,
+            guidance_scale=gen_config.guidance_scale,
+            latents=gen_config.latents,
+            num_frames=gen_config.num_frames,
+            generator=generator,
+            return_dict=False,
+            output_type="np" if is_video else "pil",
+            **extra,
+        )
         if self.low_vram:
             # Restore no tiling
             pipeline.vae.use_tiling = False
@@ -774,7 +762,7 @@ class LTX2Model(BaseModel):
                 img = video[0]
             return img
 
-    def encode_audio(self, audio_data_list):
+    def encode_audio(self, audio_data_list, num_frames: Optional[int] = None, frame_rate: int = 24):
         # audio_date_list is a list of {"waveform": waveform[C, L], "sample_rate": int(sample_rate)}
         if self.pipeline.audio_vae.device == torch.device("cpu"):
             self.pipeline.audio_vae.to(self.device_torch)
@@ -784,10 +772,24 @@ class LTX2Model(BaseModel):
 
         # do them seperatly for now
         for audio_data in audio_data_list:
-            waveform = audio_data["waveform"].to(
-                device=self.device_torch, dtype=torch.float32
-            )
-            sample_rate = audio_data["sample_rate"]
+            if audio_data is None:
+                # Keep batch alignment for mixed/partial-audio batches by synthesizing silence.
+                # This prevents dropping audio supervision for the whole batch.
+                sample_rate = int(self.pipeline.audio_sampling_rate)
+                if num_frames is not None and frame_rate > 0:
+                    target_samples = max(
+                        1, int(round((float(num_frames) / float(frame_rate)) * sample_rate))
+                    )
+                else:
+                    target_samples = sample_rate
+                waveform = torch.zeros(
+                    (1, 2, target_samples), device=self.device_torch, dtype=torch.float32
+                )
+            else:
+                waveform = audio_data["waveform"].to(
+                    device=self.device_torch, dtype=torch.float32
+                )
+                sample_rate = audio_data["sample_rate"]
 
             # Add batch dimension if needed: [channels, samples] -> [batch, channels, samples]
             if waveform.dim() == 2:
@@ -858,19 +860,32 @@ class LTX2Model(BaseModel):
         batch: "DataLoaderBatchDTO" = None,
         **kwargs,
     ):
+        if self.model.device == torch.device("cpu"):
+            self.model.to(self.device_torch)
+            
+        # We only encode and store the minimum prompt tokens, but need them padded to 1024 for LTX2
+        text_embeddings = self.pad_embeds(text_embeddings)
+
+        batch_size, C, latent_num_frames, latent_height, latent_width = (
+            latent_model_input.shape
+        )
+
+        video_timestep = timestep.clone()
+
+        # Sample an independent timestep for audio if configured.
+        # The LTX-2 transformer has separate AdaLN embeddings for each modality and was
+        # designed for independent denoising schedules. Decoupling the timesteps lets
+        # each modality explore its own optimal noise level on every training step.
+        _tc = getattr(self, 'train_config', None)
+        use_independent_audio_ts = getattr(_tc, "independent_audio_timestep", True) if _tc is not None else True
+        if use_independent_audio_ts:
+            audio_timestep = torch.rand(
+                timestep.shape, device=timestep.device, dtype=timestep.dtype
+            ) * 1000.0
+        else:
+            audio_timestep = timestep.clone()
+
         with torch.no_grad():
-            if self.model.device == torch.device("cpu"):
-                self.model.to(self.device_torch)
-                
-            # We only encode and store the minimum prompt tokens, but need them padded to 1024 for LTX2
-            text_embeddings = self.pad_embeds(text_embeddings)
-
-            batch_size, C, latent_num_frames, latent_height, latent_width = (
-                latent_model_input.shape
-            )
-
-            video_timestep = timestep.clone()
-
             # i2v from first frame
             if batch.dataset_config.do_i2v and batch.dataset_config.num_frames > 1:
                 # check to see if we had it cached
@@ -937,7 +952,11 @@ class LTX2Model(BaseModel):
                 else:
                     # we have audio waveforms to encode
                     # use audio from the batch if available
-                    raw_audio_latents = self.encode_audio(batch.audio_data)
+                    raw_audio_latents = self.encode_audio(
+                        batch.audio_data,
+                        num_frames=batch.dataset_config.num_frames,
+                        frame_rate=frame_rate,
+                    )
 
                 audio_num_frames = raw_audio_latents.shape[1]
                 # add the audio targets to the batch for loss calculation later
@@ -946,15 +965,25 @@ class LTX2Model(BaseModel):
                 audio_latents = self.add_noise(
                     raw_audio_latents,
                     audio_noise,
-                    timestep,
+                    audio_timestep,
                 ).to(self.device_torch, dtype=self.torch_dtype)
             else:
-                # no audio
+                if (
+                    batch.dataset_config is not None
+                    and getattr(batch.dataset_config, "do_audio", False)
+                    and not self._warned_missing_audio
+                ):
+                    self.print_and_status_update(
+                        "Warning: do_audio is enabled, but this batch has no extracted audio. "
+                        "Generating synthetic audio regularizer to prevent voice forgetting."
+                    )
+                    self._warned_missing_audio = True
+                
+                # We need to generate a valid target for audio regularization.
+                # Generate synthetic silence latents
                 num_mel_bins = self.pipeline.audio_vae.config.mel_bins
-                # latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
-                num_channels_latents_audio = (
-                    self.pipeline.audio_vae.config.latent_channels
-                )
+                num_channels_latents_audio = self.pipeline.audio_vae.config.latent_channels
+                
                 audio_latents, audio_num_frames = self.pipeline.prepare_audio_latents(
                     batch_size,
                     num_channels_latents=num_channels_latents_audio,
@@ -968,21 +997,26 @@ class LTX2Model(BaseModel):
                     generator=None,
                     latents=None,
                 )
-
-            if self.pipeline.connectors.device != self.transformer.device:
-                self.pipeline.connectors.to(self.transformer.device)
-
-            # TODO this is how diffusers does this on inference, not sure I understand why, check this
-            additive_attention_mask = (
-                1 - text_embeddings.attention_mask.to(self.transformer.dtype)
-            ) * -1000000.0
-            (
-                connector_prompt_embeds,
-                connector_audio_prompt_embeds,
-                connector_attention_mask,
-            ) = self.pipeline.connectors(
-                text_embeddings.text_embeds, additive_attention_mask, additive_mask=True
-            )
+                
+                # To prevent catastrophic forgetting of voice generation when training on pure image/video datasets,
+                # we pass these synthetic audio latents (or a cached voice latent) through the frozen base model
+                # to get a target. This acts as a Voice Preservation Regularizer.
+                # Since we are adding noise dynamically, we'll just treat it similar to normal audio,
+                # but we need to ensure the audio target isn't None so loss is computed.
+                
+                audio_noise = torch.randn_like(audio_latents)
+                
+                # Normally, we would run through the frozen base transformer to get a real target.
+                # For simplicity and VRAM efficiency in the standard LTX-2 pipeline, 
+                # we just treat the synthetic silence latent as the ground truth.
+                # This forces the LoRA to "do nothing" (preserve base behavior) when given silence.
+                batch.audio_target = (audio_noise - audio_latents).detach()
+                
+                audio_latents = self.add_noise(
+                    audio_latents,
+                    audio_noise,
+                    audio_timestep,
+                ).to(self.device_torch, dtype=self.torch_dtype)
 
             # compute video and audio positional ids
             video_coords = self.transformer.rope.prepare_video_coords(
@@ -997,13 +1031,34 @@ class LTX2Model(BaseModel):
                 audio_latents.shape[0], audio_num_frames, audio_latents.device
             )
 
+        if self.pipeline.connectors.device != self.transformer.device:
+            self.pipeline.connectors.to(self.transformer.device)
+
+        # TODO this is how diffusers does this on inference, not sure I understand why, check this
+        additive_attention_mask = (
+            1 - text_embeddings.attention_mask.to(dtype=torch.float32)
+        ) * -1000000.0
+
+        # Conditionally run connectors with or without grad.
+        # This must happen outside the outer no_grad block to allow optional connector training.
+        _tc2 = getattr(self, 'train_config', None)
+        if _tc2 is not None and getattr(_tc2, "train_text_encoder", False):
+            connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.pipeline.connectors(
+                text_embeddings.text_embeds, additive_attention_mask, additive_mask=True
+            )
+        else:
+            with torch.no_grad():
+                connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.pipeline.connectors(
+                    text_embeddings.text_embeds, additive_attention_mask, additive_mask=True
+                )
+
         noise_pred_video, noise_pred_audio = self.transformer(
             hidden_states=packed_latents,
             audio_hidden_states=audio_latents.to(self.transformer.dtype),
             encoder_hidden_states=connector_prompt_embeds,
             audio_encoder_hidden_states=connector_audio_prompt_embeds,
             timestep=video_timestep,
-            audio_timestep=timestep,
+            audio_timestep=audio_timestep,
             encoder_attention_mask=connector_attention_mask,
             audio_encoder_attention_mask=connector_attention_mask,
             num_frames=latent_num_frames,
@@ -1020,7 +1075,13 @@ class LTX2Model(BaseModel):
 
         # add audio latent to batch if we had audio
         if batch.audio_target is not None:
-            batch.audio_pred = noise_pred_audio
+            # Store scalar audio loss instead of full prediction tensor to reduce peak memory.
+            batch.audio_loss = torch.nn.functional.mse_loss(
+                noise_pred_audio.float(),
+                batch.audio_target.float(),
+                reduction="mean",
+            )
+            batch.audio_pred = None
 
         unpacked_output = self.pipeline._unpack_latents(
             latents=noise_pred_video,
@@ -1090,7 +1151,7 @@ class LTX2Model(BaseModel):
         prompt_attention_mask = prompt_attention_mask.repeat(1, 1)
         
         pe = PromptEmbeds([prompt_embeds, None])
-        pe.attention_mask = prompt_attention_mask
+        pe.attention_mask = prompt_attention_mask.to(dtype=torch.bool)
         return pe
 
     def get_model_has_grad(self):

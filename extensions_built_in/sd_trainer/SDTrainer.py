@@ -113,6 +113,54 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+        # strict-audio monitoring
+        self._audio_expected_batches = 0
+        self._audio_supervised_batches = 0
+
+    def _validate_audio_supervision(self, batch: DataLoaderBatchDTO):
+        if not getattr(self.train_config, "strict_audio_mode", False):
+            return
+        if batch is None or batch.dataset_config is None:
+            return
+
+        expects_audio = bool(
+            getattr(batch.dataset_config, "do_audio", False)
+            and getattr(batch.dataset_config, "num_frames", 1) > 1
+        )
+        if not expects_audio:
+            return
+
+        self._audio_expected_batches += 1
+
+        has_real_audio_data = bool(
+            batch.audio_data is not None and any([item is not None for item in batch.audio_data])
+        )
+        has_cached_audio_latents = batch.audio_latents is not None
+        has_audio_supervision = (
+            batch.audio_loss is not None
+            or (batch.audio_pred is not None and batch.audio_target is not None)
+        )
+
+        if has_audio_supervision and (has_real_audio_data or has_cached_audio_latents):
+            self._audio_supervised_batches += 1
+
+        warmup_steps = int(getattr(self.train_config, "strict_audio_warmup_steps", 50))
+        if self.step_num < warmup_steps:
+            return
+
+        if self._audio_expected_batches <= 0:
+            return
+
+        min_ratio = float(getattr(self.train_config, "strict_audio_min_supervised_ratio", 0.9))
+        current_ratio = self._audio_supervised_batches / float(self._audio_expected_batches)
+        if current_ratio < min_ratio:
+            raise ValueError(
+                "Strict audio mode triggered: insufficient audio supervision for audio-enabled video batches. "
+                f"ratio={current_ratio:.3f}, required>={min_ratio:.3f}, "
+                f"expected_batches={self._audio_expected_batches}, supervised_batches={self._audio_supervised_batches}. "
+                "Check dataset audio extraction, ensure clips have valid audio, and verify do_audio is enabled."
+            )
+
 
     def before_model_load(self):
         pass
@@ -847,24 +895,74 @@ class SDTrainer(BaseSDTrainProcess):
             loss = loss + prior_loss
 
         if not self.train_config.train_turbo:
+            _scheduler_has_snr = hasattr(self.sd.noise_scheduler, 'alphas_cumprod')
             if self.train_config.learnable_snr_gos:
                 # add snr_gamma
                 loss = apply_learnable_snr_gos(loss, timesteps, self.snr_gos)
             elif self.train_config.snr_gamma is not None and self.train_config.snr_gamma > 0.000001 and not ignore_snr:
-                # add snr_gamma
-                loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.snr_gamma,
-                                        fixed=True)
+                if _scheduler_has_snr:
+                    loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.snr_gamma,
+                                            fixed=True)
             elif self.train_config.min_snr_gamma is not None and self.train_config.min_snr_gamma > 0.000001 and not ignore_snr:
-                # add min_snr_gamma
-                loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
+                if _scheduler_has_snr:
+                    loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
         loss = loss.mean()
         
+        # automatic audio loss balancing
+        if getattr(self.train_config, "auto_balance_audio_loss", False) and (batch.audio_loss is not None or (batch.audio_pred is not None and batch.audio_target is not None)):
+            if not hasattr(self, "_ema_video_loss"):
+                self._ema_video_loss = loss.item()
+                self._ema_audio_loss = batch.audio_loss.item() if batch.audio_loss is not None else torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean").item()
+            else:
+                alpha = 0.99
+                self._ema_video_loss = alpha * self._ema_video_loss + (1 - alpha) * loss.item()
+                curr_audio_loss = batch.audio_loss.item() if batch.audio_loss is not None else torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean").item()
+                self._ema_audio_loss = alpha * self._ema_audio_loss + (1 - alpha) * curr_audio_loss
+            
+            # Target audio loss to be ~25% of total loss -> audio_loss = 0.33 * video_loss
+            target_audio_loss_mag = 0.33 * max(self._ema_video_loss, 1e-6)
+            if self._ema_audio_loss > 1e-6:
+                dynamic_multiplier = target_audio_loss_mag / self._ema_audio_loss
+            else:
+                dynamic_multiplier = 1.0
+            
+            # clamp multiplier to prevent instability (allow < 1.0 to dampen when audio > video)
+            dynamic_multiplier = max(0.05, min(20.0, dynamic_multiplier))
+            self.train_config.audio_loss_multiplier = dynamic_multiplier
+
         # check for audio loss
-        if batch.audio_pred is not None and batch.audio_target is not None:
-            audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
-            audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+        raw_audio_loss_val = None
+        scaled_audio_loss_val = None
+        if batch.audio_loss is not None:
+            audio_loss = batch.audio_loss
+            raw_audio_loss_val = audio_loss.item()
+            if hasattr(self.train_config, "audio_loss_multiplier"):
+                audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            scaled_audio_loss_val = audio_loss.item()
             loss = loss + audio_loss
+        elif batch.audio_pred is not None and batch.audio_target is not None:
+            audio_loss = torch.nn.functional.mse_loss(
+                batch.audio_pred.float(), batch.audio_target.float(), reduction="mean"
+            )
+            raw_audio_loss_val = audio_loss.item()
+            if hasattr(self.train_config, "audio_loss_multiplier"):
+                audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            scaled_audio_loss_val = audio_loss.item()
+            loss = loss + audio_loss
+
+        if raw_audio_loss_val is not None:
+            if not hasattr(self, '_audio_log_interval'):
+                self._audio_log_interval = 0
+            self._audio_log_interval += 1
+            if self._audio_log_interval % 10 == 1:
+                multiplier_str = ""
+                if getattr(self.train_config, "auto_balance_audio_loss", False):
+                    multiplier_str = f", dyn_mult={self.train_config.audio_loss_multiplier:.2f}"
+                print(
+                    f"[audio] raw={raw_audio_loss_val:.5f}, scaled={scaled_audio_loss_val:.5f}, "
+                    f"video={loss.item() - scaled_audio_loss_val:.5f}{multiplier_str}"
+                )
 
         # check for additional losses
         if self.adapter is not None and hasattr(self.adapter, "additional_loss") and self.adapter.additional_loss is not None:
@@ -2035,6 +2133,7 @@ class SDTrainer(BaseSDTrainProcess):
                     # else:
                     self.accelerator.backward(loss)
 
+        self._validate_audio_supervision(batch)
         return loss.detach()
         # flush()
 

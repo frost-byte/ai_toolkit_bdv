@@ -1285,7 +1285,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # add dynamic noise offset. Dynamic noise is offsetting the noise to the same channelwise mean as the latents
                 # this will negate any noise offsets
                 if self.train_config.dynamic_noise_offset and not is_reg:
-                    latents_channel_mean = latents.mean(dim=(2, 3), keepdim=True) / 2
+                    # Support both image latents [B, C, H, W] and video latents [B, C, T, H, W].
+                    reduce_dims = (2, 3) if len(latents.shape) == 4 else (2, 3, 4)
+                    latents_channel_mean = latents.mean(dim=reduce_dims, keepdim=True) / 2
                     # subtract channel mean to that we compensate for the mean of the latents on the noise offset per channel
                     noise = noise + latents_channel_mean
 
@@ -1589,10 +1591,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # run base sd process run
         self.sd.load_model()
         
-        # compile the model if needed
         if self.model_config.compile:
             try:
-                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+                model_to_compile = self.sd.unet
+                is_transformer_model = hasattr(self.sd, 'is_transformer') and self.sd.is_transformer and hasattr(self.sd, 'model')
+                if is_transformer_model:
+                    model_to_compile = self.sd.model
+                compiled_model = torch.compile(model_to_compile, dynamic=True, fullgraph=True, mode='max-autotune')
+                if is_transformer_model:
+                    self.sd.model = compiled_model
+                else:
+                    self.sd.unet = compiled_model
+                print_acc(f"Compiled {type(model_to_compile).__name__} with max-autotune")
             except Exception as e:
                 print_acc(f"Failed to compile model: {e}")
                 print_acc("Continuing without compilation")
@@ -1758,6 +1768,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     is_ssd=self.model_config.is_ssd,
                     is_vega=self.model_config.is_vega,
                     dropout=self.network_config.dropout,
+                    rank_dropout=self.network_config.rank_dropout,
+                    module_dropout=self.network_config.module_dropout,
                     use_text_encoder_1=self.model_config.use_text_encoder_1,
                     use_text_encoder_2=self.model_config.use_text_encoder_2,
                     use_bias=is_lorm,
